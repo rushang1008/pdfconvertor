@@ -14,8 +14,6 @@ import { toast } from "sonner";
 interface UploadedFile {
   file: File;
   preview?: string;
-  storagePath?: string;
-  publicUrl?: string;
 }
 
 interface ToolScreenProps {
@@ -24,7 +22,7 @@ interface ToolScreenProps {
   backLabel: string;
 }
 
-type ScreenState = "upload" | "uploading" | "processing" | "complete" | "error";
+type ScreenState = "upload" | "processing" | "complete" | "error";
 
 const colorClasses = {
   pdf: "bg-tool-pdf/10 text-tool-pdf",
@@ -34,7 +32,7 @@ const colorClasses = {
 };
 
 // Tools that are implemented with real processing
-const implementedTools = ['merge', 'split', 'rotate', 'secure', 'watermark', 'image-to-pdf', 'compress'];
+const implementedTools = ['merge', 'split', 'rotate', 'secure', 'watermark', 'image-to-pdf', 'compress', 'create'];
 
 export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => {
   const navigate = useNavigate();
@@ -45,19 +43,17 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const { uploading, processing, progress, uploadFiles, processFiles, reset } = useFileProcessing();
+  const { processing, progress, processFiles, reset } = useFileProcessing();
 
   const Icon = config.icon;
   const isImplemented = implementedTools.includes(config.id);
 
   // Update screen state based on processing state
   useEffect(() => {
-    if (uploading) {
-      setScreenState("uploading");
-    } else if (processing) {
+    if (processing) {
       setScreenState("processing");
     }
-  }, [uploading, processing]);
+  }, [processing]);
 
   const handleOptionChange = useCallback((id: string, value: string | number | boolean) => {
     setOptionValues((prev) => ({ ...prev, [id]: value }));
@@ -67,26 +63,16 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
     if (!isImplemented) {
       // Simulate processing for non-implemented tools
       setScreenState("processing");
-      
-      const interval = setInterval(() => {
-        setScreenState((prev) => {
-          if (prev === "processing") {
-            setTimeout(() => setScreenState("complete"), 2000);
-          }
-          return prev;
-        });
-      }, 2000);
-      
       setTimeout(() => {
-        clearInterval(interval);
         setScreenState("complete");
         toast.info("This tool is in demo mode. Full processing coming soon!");
-      }, 3000);
+      }, 2500);
       return;
     }
 
     try {
       setErrorMessage(null);
+      setScreenState("processing");
       
       // Validate password fields for secure tool
       if (config.id === 'secure') {
@@ -95,10 +81,12 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
         
         if (!password) {
           toast.error("Please enter a password");
+          setScreenState("upload");
           return;
         }
         if (password !== confirmPassword) {
           toast.error("Passwords do not match");
+          setScreenState("upload");
           return;
         }
       }
@@ -106,31 +94,15 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
       // Validate watermark text
       if (config.id === 'watermark' && !optionValues.watermarkText) {
         toast.error("Please enter watermark text");
+        setScreenState("upload");
         return;
-      }
-
-      // Upload files first
-      const uploadedFiles = await uploadFiles(files.map(f => f.file));
-      
-      if (uploadedFiles.length === 0) {
-        throw new Error("No files were uploaded");
-      }
-
-      // Get file URLs for processing
-      const fileUrls = uploadedFiles
-        .map(f => f.publicUrl)
-        .filter((url): url is string => !!url);
-
-      if (fileUrls.length === 0) {
-        throw new Error("Failed to get file URLs");
       }
 
       // Process files
       const result = await processFiles(
         config.id,
-        fileUrls,
-        optionValues,
-        files[0]?.file.name || 'document'
+        files.map(f => f.file),
+        optionValues
       );
 
       if (result.success && result.downloadUrl) {
@@ -141,22 +113,23 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
         setErrorMessage(result.error || "Processing failed");
         setScreenState("error");
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error("Processing error:", error);
-      setErrorMessage(error.message || "An unexpected error occurred");
+      const errorMsg = error instanceof Error ? error.message : "An unexpected error occurred";
+      setErrorMessage(errorMsg);
       setScreenState("error");
     }
-  }, [config.id, files, optionValues, uploadFiles, processFiles, isImplemented]);
+  }, [config.id, files, optionValues, processFiles, isImplemented]);
 
   const handleDownload = useCallback(() => {
     if (downloadUrl) {
       const link = document.createElement("a");
       link.href = downloadUrl;
       link.download = `processed-${files[0]?.file.name || 'document.pdf'}`;
-      link.target = "_blank";
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
+      toast.success("Download started!");
     } else if (!isImplemented) {
       toast.info("Demo mode - no actual file generated");
     }
@@ -282,17 +255,11 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
             </div>
           ) : (
             <ProcessingState
-              status={
-                screenState === "uploading" || screenState === "processing" 
-                  ? "processing" 
-                  : screenState === "complete" 
-                    ? "complete" 
-                    : "error"
-              }
-              progress={Math.min(progress, 100)}
+              status={screenState === "processing" ? "processing" : screenState === "complete" ? "complete" : "error"}
+              progress={Math.min(Math.round(progress), 100)}
               onDownload={handleDownload}
               onReset={handleReset}
-              errorMessage={errorMessage}
+              errorMessage={errorMessage || undefined}
             />
           )}
         </motion.div>
@@ -304,7 +271,7 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
           transition={{ delay: 0.3 }}
           className="text-center text-sm text-muted-foreground mt-6"
         >
-          🔒 {user ? "Your files are saved to your account" : "Your files are automatically deleted after 30 minutes"}
+          🔒 {user ? "Your files are saved to your account" : "Your files are processed securely and not stored"}
         </motion.p>
       </div>
     </div>
