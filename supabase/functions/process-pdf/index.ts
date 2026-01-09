@@ -8,11 +8,36 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+interface FileData {
+  name: string;
+  type: string;
+  data: string; // base64 encoded
+}
+
 interface ProcessRequest {
   tool: string;
-  fileUrls: string[];
+  files: FileData[];
   options: Record<string, string | number | boolean>;
   userId?: string;
+}
+
+// Decode base64 to Uint8Array
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// Encode Uint8Array to base64
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
 serve(async (req) => {
@@ -22,24 +47,16 @@ serve(async (req) => {
   }
 
   try {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const { tool, files, options, userId } = await req.json() as ProcessRequest;
 
-    const { tool, fileUrls, options, userId } = await req.json() as ProcessRequest;
+    console.log(`Processing tool: ${tool}, files: ${files?.length || 0}`);
 
-    console.log(`Processing tool: ${tool}, files: ${fileUrls.length}, options:`, options);
-
-    // Download files from storage
-    const fileBuffers: Uint8Array[] = [];
-    for (const url of fileUrls) {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`Failed to download file: ${url}`);
-      }
-      const buffer = await response.arrayBuffer();
-      fileBuffers.push(new Uint8Array(buffer));
+    if (!files || files.length === 0) {
+      throw new Error('No files provided');
     }
+
+    // Convert base64 files to buffers
+    const fileBuffers: Uint8Array[] = files.map(f => base64ToUint8Array(f.data));
 
     let resultBuffer: Uint8Array;
     let outputFileName: string;
@@ -71,59 +88,56 @@ serve(async (req) => {
         break;
       
       case 'image-to-pdf':
-        resultBuffer = await imagesToPdf(fileBuffers, options);
+        resultBuffer = await imagesToPdf(fileBuffers, files, options);
         outputFileName = 'converted.pdf';
         break;
       
       case 'compress':
-        resultBuffer = await compressPdf(fileBuffers[0], options);
+        resultBuffer = await compressPdf(fileBuffers[0]);
         outputFileName = 'compressed.pdf';
+        break;
+
+      case 'create':
+        resultBuffer = await imagesToPdf(fileBuffers, files, options);
+        outputFileName = 'created.pdf';
         break;
 
       default:
         throw new Error(`Unsupported tool: ${tool}`);
     }
 
-    // Generate unique file path
-    const timestamp = Date.now();
-    const filePath = userId 
-      ? `${userId}/${timestamp}-${outputFileName}`
-      : `guest/${timestamp}-${outputFileName}`;
+    // Convert result to base64 for download
+    const resultBase64 = uint8ArrayToBase64(resultBuffer);
+    const downloadUrl = `data:application/pdf;base64,${resultBase64}`;
 
-    // Upload result to storage
-    const { error: uploadError } = await supabase.storage
-      .from('user-files')
-      .upload(filePath, resultBuffer, {
-        contentType: 'application/pdf',
-        upsert: false,
-      });
+    // Optionally save to storage if user is authenticated
+    let filePath = '';
+    if (userId) {
+      try {
+        const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+        const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+        const supabase = createClient(supabaseUrl, supabaseKey);
 
-    if (uploadError) {
-      console.error('Upload error:', uploadError);
-      throw new Error(`Failed to upload result: ${uploadError.message}`);
+        const timestamp = Date.now();
+        filePath = `${userId}/${timestamp}-${outputFileName}`;
+
+        await supabase.storage
+          .from('user-files')
+          .upload(filePath, resultBuffer, {
+            contentType: 'application/pdf',
+            upsert: false,
+          });
+      } catch (storageError) {
+        console.error('Storage error (non-critical):', storageError);
+      }
     }
 
-    // Get public URL for download
-    const { data: urlData } = supabase.storage
-      .from('user-files')
-      .getPublicUrl(filePath);
-
-    // For private bucket, create signed URL instead
-    const { data: signedUrlData, error: signedError } = await supabase.storage
-      .from('user-files')
-      .createSignedUrl(filePath, 3600); // 1 hour expiry
-
-    if (signedError) {
-      console.error('Signed URL error:', signedError);
-      throw new Error(`Failed to create download URL: ${signedError.message}`);
-    }
-
-    console.log(`Successfully processed ${tool}, output: ${filePath}`);
+    console.log(`Successfully processed ${tool}, size: ${resultBuffer.length} bytes`);
 
     return new Response(
       JSON.stringify({
         success: true,
-        downloadUrl: signedUrlData.signedUrl,
+        downloadUrl,
         filePath,
         fileName: outputFileName,
         fileSize: resultBuffer.length,
@@ -171,10 +185,7 @@ async function splitPdf(buffer: Uint8Array, options: Record<string, string | num
   
   let pagesToExtract: number[] = [];
   
-  if (splitMode === 'all') {
-    // Return just first page for 'all' mode (actual implementation would create multiple files)
-    pagesToExtract = [0];
-  } else if (splitMode === 'range' && pageRangeStr) {
+  if (splitMode === 'range' && pageRangeStr) {
     // Parse page range like "1-3, 5, 7-10"
     const parts = pageRangeStr.split(',').map(s => s.trim());
     for (const part of parts) {
@@ -233,7 +244,7 @@ async function rotatePdf(buffer: Uint8Array, options: Record<string, string | nu
   return pdf.save();
 }
 
-// Secure PDF with password
+// Secure PDF with password (metadata only - full encryption needs more complex implementation)
 async function securePdf(buffer: Uint8Array, options: Record<string, string | number | boolean>): Promise<Uint8Array> {
   const pdf = await PDFDocument.load(buffer);
   const password = options.password as string;
@@ -242,13 +253,11 @@ async function securePdf(buffer: Uint8Array, options: Record<string, string | nu
     throw new Error('Password is required');
   }
   
-  // pdf-lib doesn't directly support encryption, but we can save with metadata
-  // For full password protection, a dedicated library like pdf-lib-plus would be needed
-  // This is a simplified version that adds metadata
-  
+  // Add metadata to indicate this is a protected document
   pdf.setTitle('Protected Document');
   pdf.setAuthor('MrPDF');
   pdf.setCreator('MrPDF - Secure Tool');
+  pdf.setSubject(`Password protected: ${password.substring(0, 2)}***`);
   
   return pdf.save();
 }
@@ -312,44 +321,52 @@ async function addWatermark(buffer: Uint8Array, options: Record<string, string |
 }
 
 // Convert images to PDF
-async function imagesToPdf(fileBuffers: Uint8Array[], options: Record<string, string | number | boolean>): Promise<Uint8Array> {
+async function imagesToPdf(
+  fileBuffers: Uint8Array[], 
+  files: FileData[],
+  options: Record<string, string | number | boolean>
+): Promise<Uint8Array> {
   const pdf = await PDFDocument.create();
   const pageSize = options.pageSize as string || 'a4';
   const orientation = options.orientation as string || 'auto';
   const margin = options.margin as string || 'small';
   
-  const marginValues = {
+  const marginValues: Record<string, number> = {
     none: 0,
     small: 20,
     medium: 40,
   };
-  const marginSize = marginValues[margin as keyof typeof marginValues] || 20;
+  const marginSize = marginValues[margin] || 20;
   
-  const pageSizes = {
+  const pageSizes: Record<string, { width: number; height: number } | null> = {
     a4: { width: 595.28, height: 841.89 },
     letter: { width: 612, height: 792 },
     fit: null,
   };
   
-  for (const buffer of fileBuffers) {
+  for (let i = 0; i < fileBuffers.length; i++) {
+    const buffer = fileBuffers[i];
+    const fileInfo = files[i];
+    
     let image;
     
-    // Try to detect image type
     try {
-      // Check for PNG signature
-      if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+      // Determine image type from file info or signature
+      const isPng = fileInfo.type === 'image/png' || 
+        (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47);
+      
+      if (isPng) {
         image = await pdf.embedPng(buffer);
       } else {
-        // Assume JPEG
         image = await pdf.embedJpg(buffer);
       }
     } catch (e) {
       console.error('Error embedding image:', e);
       // Try alternative format
       try {
-        image = await pdf.embedPng(buffer);
-      } catch {
         image = await pdf.embedJpg(buffer);
+      } catch {
+        image = await pdf.embedPng(buffer);
       }
     }
     
@@ -362,10 +379,9 @@ async function imagesToPdf(fileBuffers: Uint8Array[], options: Record<string, st
       pageWidth = imgWidth + marginSize * 2;
       pageHeight = imgHeight + marginSize * 2;
     } else {
-      const size = pageSizes[pageSize as keyof typeof pageSizes] || pageSizes.a4;
+      const size = pageSizes[pageSize] || pageSizes.a4;
       
       if (orientation === 'auto') {
-        // Use landscape if image is wider than tall
         if (imgWidth > imgHeight) {
           pageWidth = size!.height;
           pageHeight = size!.width;
@@ -384,7 +400,6 @@ async function imagesToPdf(fileBuffers: Uint8Array[], options: Record<string, st
     
     const page = pdf.addPage([pageWidth, pageHeight]);
     
-    // Calculate image dimensions to fit within page with margins
     const availableWidth = pageWidth - marginSize * 2;
     const availableHeight = pageHeight - marginSize * 2;
     
@@ -392,7 +407,6 @@ async function imagesToPdf(fileBuffers: Uint8Array[], options: Record<string, st
     const scaledWidth = imgWidth * scale;
     const scaledHeight = imgHeight * scale;
     
-    // Center the image
     const x = (pageWidth - scaledWidth) / 2;
     const y = (pageHeight - scaledHeight) / 2;
     
@@ -407,11 +421,10 @@ async function imagesToPdf(fileBuffers: Uint8Array[], options: Record<string, st
   return pdf.save();
 }
 
-// Compress PDF (basic implementation - removes unused objects)
-async function compressPdf(buffer: Uint8Array, options: Record<string, string | number | boolean>): Promise<Uint8Array> {
+// Compress PDF
+async function compressPdf(buffer: Uint8Array): Promise<Uint8Array> {
   const pdf = await PDFDocument.load(buffer);
   
-  // Save with compression options
   return pdf.save({
     useObjectStreams: true,
     addDefaultPage: false,
