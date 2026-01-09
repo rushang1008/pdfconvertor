@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { motion } from "framer-motion";
 import { ArrowLeft, Crown } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
@@ -7,10 +7,15 @@ import { ToolConfig } from "@/lib/toolConfig";
 import { FileUpload } from "./FileUpload";
 import { ToolOptions } from "./ToolOptions";
 import { ProcessingState } from "./ProcessingState";
+import { useFileProcessing } from "@/hooks/useFileProcessing";
+import { useAuth } from "@/contexts/AuthContext";
+import { toast } from "sonner";
 
 interface UploadedFile {
   file: File;
   preview?: string;
+  storagePath?: string;
+  publicUrl?: string;
 }
 
 interface ToolScreenProps {
@@ -19,7 +24,7 @@ interface ToolScreenProps {
   backLabel: string;
 }
 
-type ScreenState = "upload" | "processing" | "complete" | "error";
+type ScreenState = "upload" | "uploading" | "processing" | "complete" | "error";
 
 const colorClasses = {
   pdf: "bg-tool-pdf/10 text-tool-pdf",
@@ -28,52 +33,144 @@ const colorClasses = {
   ai: "bg-tool-ai/10 text-tool-ai",
 };
 
+// Tools that are implemented with real processing
+const implementedTools = ['merge', 'split', 'rotate', 'secure', 'watermark', 'image-to-pdf', 'compress'];
+
 export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [optionValues, setOptionValues] = useState<Record<string, string | number | boolean>>({});
   const [screenState, setScreenState] = useState<ScreenState>("upload");
-  const [progress, setProgress] = useState(0);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const { uploading, processing, progress, uploadFiles, processFiles, reset } = useFileProcessing();
 
   const Icon = config.icon;
+  const isImplemented = implementedTools.includes(config.id);
+
+  // Update screen state based on processing state
+  useEffect(() => {
+    if (uploading) {
+      setScreenState("uploading");
+    } else if (processing) {
+      setScreenState("processing");
+    }
+  }, [uploading, processing]);
 
   const handleOptionChange = useCallback((id: string, value: string | number | boolean) => {
     setOptionValues((prev) => ({ ...prev, [id]: value }));
   }, []);
 
-  const handleProcess = useCallback(() => {
-    setScreenState("processing");
-    setProgress(0);
+  const handleProcess = useCallback(async () => {
+    if (!isImplemented) {
+      // Simulate processing for non-implemented tools
+      setScreenState("processing");
+      
+      const interval = setInterval(() => {
+        setScreenState((prev) => {
+          if (prev === "processing") {
+            setTimeout(() => setScreenState("complete"), 2000);
+          }
+          return prev;
+        });
+      }, 2000);
+      
+      setTimeout(() => {
+        clearInterval(interval);
+        setScreenState("complete");
+        toast.info("This tool is in demo mode. Full processing coming soon!");
+      }, 3000);
+      return;
+    }
 
-    // Simulate processing
-    const interval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          setScreenState("complete");
-          return 100;
+    try {
+      setErrorMessage(null);
+      
+      // Validate password fields for secure tool
+      if (config.id === 'secure') {
+        const password = optionValues.password as string;
+        const confirmPassword = optionValues.confirmPassword as string;
+        
+        if (!password) {
+          toast.error("Please enter a password");
+          return;
         }
-        return prev + Math.random() * 15 + 5;
-      });
-    }, 300);
-  }, []);
+        if (password !== confirmPassword) {
+          toast.error("Passwords do not match");
+          return;
+        }
+      }
+
+      // Validate watermark text
+      if (config.id === 'watermark' && !optionValues.watermarkText) {
+        toast.error("Please enter watermark text");
+        return;
+      }
+
+      // Upload files first
+      const uploadedFiles = await uploadFiles(files.map(f => f.file));
+      
+      if (uploadedFiles.length === 0) {
+        throw new Error("No files were uploaded");
+      }
+
+      // Get file URLs for processing
+      const fileUrls = uploadedFiles
+        .map(f => f.publicUrl)
+        .filter((url): url is string => !!url);
+
+      if (fileUrls.length === 0) {
+        throw new Error("Failed to get file URLs");
+      }
+
+      // Process files
+      const result = await processFiles(
+        config.id,
+        fileUrls,
+        optionValues,
+        files[0]?.file.name || 'document'
+      );
+
+      if (result.success && result.downloadUrl) {
+        setDownloadUrl(result.downloadUrl);
+        setScreenState("complete");
+        toast.success("File processed successfully!");
+      } else {
+        setErrorMessage(result.error || "Processing failed");
+        setScreenState("error");
+      }
+    } catch (error: any) {
+      console.error("Processing error:", error);
+      setErrorMessage(error.message || "An unexpected error occurred");
+      setScreenState("error");
+    }
+  }, [config.id, files, optionValues, uploadFiles, processFiles, isImplemented]);
 
   const handleDownload = useCallback(() => {
-    // Simulate download
-    const link = document.createElement("a");
-    link.href = "#";
-    link.download = "processed-file.pdf";
-    // In real implementation, this would trigger actual download
-    console.log("Downloading file...");
-  }, []);
+    if (downloadUrl) {
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `processed-${files[0]?.file.name || 'document.pdf'}`;
+      link.target = "_blank";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } else if (!isImplemented) {
+      toast.info("Demo mode - no actual file generated");
+    }
+  }, [downloadUrl, files, isImplemented]);
 
   const handleReset = useCallback(() => {
     setFiles([]);
     setOptionValues({});
     setScreenState("upload");
-    setProgress(0);
+    setDownloadUrl(null);
+    setErrorMessage(null);
+    reset();
     navigate(backLink);
-  }, [navigate, backLink]);
+  }, [navigate, backLink, reset]);
 
   const isReady = files.length > 0;
 
@@ -120,6 +217,12 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
           <p className="text-muted-foreground max-w-xl mx-auto">
             {config.longDescription}
           </p>
+
+          {!isImplemented && (
+            <p className="text-xs text-amber-500 mt-2">
+              ⚠️ Demo mode - full processing coming soon
+            </p>
+          )}
         </motion.div>
 
         {/* Main Content */}
@@ -169,13 +272,27 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
                   {config.actionLabel}
                 </Button>
               </motion.div>
+
+              {/* Login prompt for guests */}
+              {!user && (
+                <p className="text-center text-sm text-muted-foreground">
+                  <Link to="/auth" className="text-primary hover:underline">Sign in</Link> to save your file history
+                </p>
+              )}
             </div>
           ) : (
             <ProcessingState
-              status={screenState === "processing" ? "processing" : screenState === "complete" ? "complete" : "error"}
+              status={
+                screenState === "uploading" || screenState === "processing" 
+                  ? "processing" 
+                  : screenState === "complete" 
+                    ? "complete" 
+                    : "error"
+              }
               progress={Math.min(progress, 100)}
               onDownload={handleDownload}
               onReset={handleReset}
+              errorMessage={errorMessage}
             />
           )}
         </motion.div>
@@ -187,7 +304,7 @@ export const ToolScreen = ({ config, backLink, backLabel }: ToolScreenProps) => 
           transition={{ delay: 0.3 }}
           className="text-center text-sm text-muted-foreground mt-6"
         >
-          🔒 Your files are automatically deleted after 30 minutes
+          🔒 {user ? "Your files are saved to your account" : "Your files are automatically deleted after 30 minutes"}
         </motion.p>
       </div>
     </div>
