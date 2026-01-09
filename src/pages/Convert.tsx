@@ -1,6 +1,9 @@
+import { useSearchParams } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { motion } from "framer-motion";
 import { ToolCard } from "@/components/home/ToolCard";
+import { ToolScreen } from "@/components/tools/ToolScreen";
+import { getToolConfig } from "@/lib/toolConfig";
 import {
   FileOutput,
   FileInput,
@@ -33,6 +36,24 @@ const itemVariants = {
 };
 
 const Convert = () => {
+  const [searchParams] = useSearchParams();
+  const toolId = searchParams.get("tool");
+  const toolConfig = toolId ? getToolConfig(toolId) : null;
+
+  // Show tool screen if a tool is selected
+  if (toolConfig) {
+    return (
+      <Layout>
+        <ToolScreen
+          config={toolConfig}
+          backLink="/convert"
+          backLabel="Back to Convert Tools"
+        />
+      </Layout>
+    );
+  }
+
+  // Show tool grid
   return (
     <Layout>
       <section className="py-20 bg-gradient-hero min-h-screen">
